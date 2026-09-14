@@ -41,7 +41,11 @@ But what is `mmap`? `mmap` is a system call that maps a virtual memory region to
 
 Concretely, in our Llama example, the `DefaultModelLoader` calls methods like `multi_thread_safetensors_weights_iterator`, which return an iterator over pairs (`tensor_name`, `tensor_weights`) where `tensor_weights` is an `mmap`'ed tensor. This iterator is passed to `LlamaForCausalLM`, which passes each parameter (like `ColumnParallelLinear`) its tensor weights. The parameter will then get a view of its needed weights according to its rank (`tp_rank` in the case of `ColumnParallelLinear`) and will then initiate a host (CPU) to device (GPU) copy of the weights.
 
+<div style="max-width:700px;margin-inline:auto;">
+
 ![Weight loading: mmap to shard to GPU](./weight-loading.png)
+
+</div>
 
 Our hypothesis is that this triggers a **major page fault** for each page touched, which gets loaded from Lustre going through the network to the page cache and then copied to GPU. This would be a very slow process, especially for large models with many tensors spread over many pages [2].
 
@@ -83,7 +87,11 @@ done
 
 We measure this on a single-striped 4.6 GB shard, reading a 4 GiB window of it (`bs=16M`, `O_DIRECT`, to `/dev/null`) while sweeping the number of parallel `dd` processes over disjoint, contiguous byte ranges of the same file. Each point is the median of 3 runs; bars span min to max:
 
+<div style="max-width:500px;margin-inline:auto;">
+
 ![OST read throughput keeps scaling with the number of parallel readers](./ost_queue_depth.png)
+
+</div>
 
 Throughput scales close to linearly with reader count up to 8, then keeps climbing sublinearly: 64 readers reach **6.7 GB/s**, an **18x** speedup over a single reader, and the curve has still not flattened. With many processes, we are able to keep many RPCs in flight, improving the bandwidth.
 
@@ -93,7 +101,11 @@ Equipped with this knowledge, we try the following:
 
 * Load in parallel (60 processes per file, which is maybe too much) from Lustre to `/dev/shm` (RAM), and then use SGLang's default loader from `/dev/shm` to GPU. The staging takes `7s`, which is more than **18 GiB/s**, already much better than everything we have seen before. The weight loading takes `20s`, which is `> 6 GiB/s`. Overall, this is a **16x speedup** over the default loader.
 
+<div style="max-width:700px;margin-inline:auto;">
+
 ![Parallel processes read file chunks from different OSTs on Lustre into /dev/shm, which SGLang then reads from](./parallel-reads-lustre.png)
+
+</div>
 
 * This idea is possible because each node in both our clusters (Bristen and Clariden) has more RAM than GPU RAM. This means a node's specific shard of weights can always be stored in RAM if we preshard the weights across nodes. This is what we do next. We use `--load-format sharded_state`, which lets us save our weights by their TP rank. One added benefit is that our weights are now contiguous for each rank, which speeds up our H2D reads (see below).
 
