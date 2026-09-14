@@ -9,15 +9,13 @@ repoURL: "https://github.com/eth-easl/servekit"
 
 *This work has been conducted as an internship at the EPFL AI Center and was supervised by [Xiaozhe Yao](https://about.yao.sh/), Systems Group, ETHZ.*
 
-This summer, I had the opportunity to intern at the EPFL AI Center and work on improving the cold start time of LLMs on the [SwissAI serving platform](https://serving.swissai.svc.cscs.ch/): a research platform for serving LLMs on CSCS clusters on top of SLURM and [FirecREST](https://www.cscs.ch/services/products/firecrest) with the goal of enabling researchers to serve and use LLMs. One current limitation of the platform (and many inference engines in general) is that cold start times are long, which slows down research and wastes resources.
+Inference engines such as vLLM and SGLang must go through several steps before they can serve requests (e.g., importing dependencies, loading model weights, capturing CUDA graphs, etc.). This creates a significant **cold-start latency**. On the SwissAI serving platform, we observed that most of this time is spent loading model weights from a [Lustre](https://www.lustre.org/) datastore into GPU memory.
 
-In general, inference engines like vLLM or SGLang need to go through many steps before they can serve requests (for e.g., importing the dependencies, loading the model, capturing CUDA graphs, etc.). In the case of the SwissAI serving platform, we observed that most of the cold start time is spent loading weights from a [Lustre](https://www.lustre.org/) datastore to the GPU.
-
-In this post, I'll focus on **weight loading from Lustre datastores**. I'll show you how I was able to reduce the weight-loading time from **~827s to ~16s** (GLM-4.7). The ideas are packaged in a small wrapper called [servekit](https://github.com/eth-easl/servekit).
+In this post, we focus on **weight loading from HDD-backed Lustre storage**. We show how we reduced the weight-loading time for GLM-4.7 from **~827 seconds to ~16 seconds (51× faster)**. The resulting approach is packaged in a small wrapper called [servekit](https://github.com/eth-easl/servekit).
 
 ## I. Time Breakdown
 
-Let's first map the cold start steps to their wall-clock time to identify the bottlenecks. We can do this by parsing the logs printed by the SGLang server during the cold start phase. I added the log parser to `servekit` as a CLI command: `servekit profile`.
+Let's first map the cold start steps to their wall-clock time to identify the bottlenecks. We can do this by parsing the logs printed by the SGLang server during the cold start phase. We added the log parser to `servekit` as a CLI command: `servekit profile`.
 
 For this experiment, we use `Llama-3.1-70B-Instruct` served with SGLang v0.5.10 (image `lmsysorg/sglang:v0.5.10`) with tensor-parallel size 4 on a single Bristen cluster node, with weights loaded with the default sglang model loader. SML keeps models in `capstor/store`, which is a [Lustre](https://www.lustre.org/) file system backed by HDDs.
 
@@ -45,7 +43,7 @@ Concretely, in our Llama example, the `DefaultModelLoader` calls methods like `m
 
 ![Weight loading: mmap to shard to GPU](./weight-loading.png)
 
-My hypothesis is that this triggers a **major page fault** for each page touched, which gets loaded from Lustre going through the network to the page cache and then copied to GPU. This would be a very slow process, especially for large models with many tensors spread over many pages [2].
+Our hypothesis is that this triggers a **major page fault** for each page touched, which gets loaded from Lustre going through the network to the page cache and then copied to GPU. This would be a very slow process, especially for large models with many tensors spread over many pages [2].
 
 To check this, we run the exact same experiment with SGLang's `--weight-loader-disable-mmap`, which skips `mmap` entirely.
 
@@ -99,7 +97,7 @@ Equipped with this knowledge, we try the following:
 
 * This idea is possible because each node in both our clusters (Bristen and Clariden) has more RAM than GPU RAM. This means a node's specific shard of weights can always be stored in RAM if we preshard the weights across nodes. This is what we do next. We use `--load-format sharded_state`, which lets us save our weights by their TP rank. One added benefit is that our weights are now contiguous for each rank, which speeds up our H2D reads (see below).
 
-* Additionally, we can overlap the staging with the SGLang server launch. This is possible because the first steps (`process_startup`, `tp_worker_spawn`, `torch_distributed_init`) do not need the weights. We can start staging to `/dev/shm` while the server is still in `process_startup`. This is what I report below as **/dev/shm staging + presharded + overlap**.
+* Additionally, we can overlap the staging with the SGLang server launch. This is possible because the first steps (`process_startup`, `tp_worker_spawn`, `torch_distributed_init`) do not need the weights. We can start staging to `/dev/shm` while the server is still in `process_startup`. This is what we report below as **/dev/shm staging + presharded + overlap**.
 
 * Staging to `/dev/shm` is better than warming up the page cache for models that don't fit in a single node. For these, to warm all the weights a rank needs, we would need to fill the page cache with all weights of the model which don't fit in the RAM.
 
@@ -127,7 +125,7 @@ Here's the current breakdown of the cold start of our best method, **/dev/shm st
 
 ### 3. Fast weight loading with servekit
 
-I packaged the above ideas into a small wrapper called `servekit` that can be used to launch SGLang servers with fast cold starts. It is not a new serving engine: it simply stages and launches SGLang with the optimizations described above. Currently, `servekit` implements fast weight loading and JIT kernel caching (the latter is outside the scope of this post).
+We packaged the above ideas into a small wrapper called `servekit` that can be used to launch SGLang servers with fast cold starts. It is not a new serving engine: it simply stages and launches SGLang with the optimizations described above. Currently, `servekit` implements fast weight loading and JIT kernel caching (the latter is outside the scope of this post).
 
 [`servekit`](https://github.com/eth-easl/servekit) has a main command, `servekit launch`, which takes a normal SGLang command as an argument and launches it with optimizations.
 
@@ -180,7 +178,7 @@ This sweep uses SGLang v0.5.16 (image `lmsysorg/sglang:v0.5.16`).
 
 - **On Correctness**: `servekit` relies on `ShardedStateLoader`, the loader behind `--load-format sharded_state`, which we discovered contained some bugs. To spot bugs, we use `servekit verify --url <ip> -record gold.json` to record the gold logprobs of a model served with the default loader, and then use `servekit verify --url <ip> -compare gold.json` to compare the logprobs of the same model served with `servekit`. This is a very strict test that checks that the logprobs are equal up to `1e-6`. All models above pass this test. However, some models currently don't, because of bugs in `ShardedStateLoader` (e.g. `gpt-oss-20b`). It is therefore important, when using `servekit`, to first check that your model is supported with `servekit verify`. See [this sbatch script](https://github.com/eth-easl/servekit/blob/main/tests/e2e/scripts/glm51-fp8-multinode-pp.sbatch) for an example of how we use `servekit verify` to check a model (GLM-5.1-FP8, multinode, TP4/PP4/EP4) against a baseline before trusting the presharded loader for it.
 
-  I discovered and reported two bugs in `ShardedStateLoader` to the SGLang team: [#34448](https://github.com/sgl-project/sglang/issues/34448) (mxfp4 weights are silently dropped, relevant for Kimi-K3) and [#35702](https://github.com/sgl-project/sglang/issues/35702) (`sharded_state` cannot load MLA models, relevant for GLM-5.x; `servekit` currently patches this one, but that is not a permanent solution). The corresponding fixes are in PRs [#35715](https://github.com/sgl-project/sglang/pull/35715) and [#34558](https://github.com/sgl-project/sglang/pull/34558), respectively.
+  We discovered and reported two bugs in `ShardedStateLoader` to the SGLang team: [#34448](https://github.com/sgl-project/sglang/issues/34448) (mxfp4 weights are silently dropped, relevant for Kimi-K3) and [#35702](https://github.com/sgl-project/sglang/issues/35702) (`sharded_state` cannot load MLA models, relevant for GLM-5.x; `servekit` currently patches this one, but that is not a permanent solution). The corresponding fixes are in PRs [#35715](https://github.com/sgl-project/sglang/pull/35715) and [#34558](https://github.com/sgl-project/sglang/pull/34558), respectively.
 
 - **On ergonomics**: Presharding the models implies a separate prepare step; `servekit` tries to simplify this by doing it automatically on the first run, so users don't need to worry about it. When running `servekit launch --servekit-artifact-path <path> python -m sglang.launch_server ...`, a presharded copy of the model is created in `<path>`. This causes a first run to be slower than the default loader.
 
@@ -195,7 +193,11 @@ This sweep uses SGLang v0.5.16 (image `lmsysorg/sglang:v0.5.16`).
 
 ## Final Thoughts
 
-I learnt a lot in this project! I hope this post will be of help to you if you are facing slow weight loading times. If you use HDD backed Lustre storage for your weights and you want to try [`servekit`](https://github.com/eth-easl/servekit), do not hesitate to open an issue on the [servekit repository](https://github.com/eth-easl/servekit). I will be happy to help you get started with it.
+We hope this post is useful if you are facing slow weight-loading times on HDD-backed Lustre storage. The approach described here is packaged in [`servekit`](https://github.com/eth-easl/servekit) and can be used as a drop-in wrapper around SGLang.
+
+If you would like to try `servekit`, feel free to open an issue on the [servekit repository](https://github.com/eth-easl/servekit). We will be happy to help you get started.
+
+There are also several directions to be explored to extend this work, including support for vLLM and additional SGLang model architectures.
 
 ## References
 
