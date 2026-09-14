@@ -191,7 +191,7 @@ This sweep uses SGLang v0.5.16 (image `lmsysorg/sglang:v0.5.16`).
 | `--load-format fastsafetensors` | - One flag, significant speedups | - Doesn't work for multi-node yet; GLM-4.7 result needed a patched version<br>- Scales badly with node count due to costly NCCL through Slingshot |
 | servekit | - Fastest across all models<br>- If model size scales linearly with node count, weight size loaded per node is constant and so is time (see Llama vs. GLM-4.7, 14s vs. 16s) | - Slower first run<br>- Relies on `ShardedStateLoader`, a correctness check is needed |
 
-## Final Thoughts
+## Conclusion
 
 We hope this post is useful if you are facing slow weight-loading times on HDD-backed Lustre storage. The approach described here is packaged in [`servekit`](https://github.com/eth-easl/servekit) and can be used as a drop-in wrapper around SGLang.
 
