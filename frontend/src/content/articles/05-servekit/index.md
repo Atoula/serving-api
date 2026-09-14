@@ -1,8 +1,9 @@
 ---
 title: "Servekit: Fast LLM weights loading from Lustre datastores"
-description: "Cold starts on the SwissAI serving platform spend most of their time loading LLM weights from a Lustre datastore. We break down where the time goes, show why mmap is the culprit, and cut weight loading from ~827s to ~16s on GLM-4.7 by staging presharded weights into /dev/shm with parallel reads — packaged as servekit."
+description: "Cold starts on the SwissAI serving platform spend most of their time loading LLM weights from a Lustre datastore. We break down where the time goes, show why mmap is the culprit, and cut weight loading from ~827s to ~16s on GLM-4.7 by staging presharded weights into /dev/shm with parallel reads - packaged as servekit."
 date: "Sep 14 2026"
 authors: [{ name: "Youssef Boughizane", url: "https://youssef62.github.io/" }]
+demoURL: "https://github.com/youssef62/cold-start-elimination-experiments-swissai"
 repoURL: "https://github.com/eth-easl/servekit"
 ---
 
@@ -38,13 +39,13 @@ This raises the obvious question:
 
 The default SGLang loader uses `mmap` to load the weight files.
 
-But what is `mmap`? `mmap` is a system call that maps a virtual memory region to a file. (For a longer explanation of mmap, see [my other blog post](https://youssef62.github.io/mmap.html).) That memory region will not be mapped to a physical memory region until it is accessed a first time. When a `mmap`ed page is accessed for the first time, the kernel will realize that the virtual page does not have a corresponding physical page but is `mmap`ed to a file. So it will load the corresponding page from disk to the page cache (RAM) and then associate the virtual page with the page cache page. This is called a **major page fault**. On subsequent access, the virtual page is already mapped to a physical page in the page cache and no disk access is needed. This is called a **minor page fault**. [^1]
+But what is `mmap`? `mmap` is a system call that maps a virtual memory region to a file. That memory region will not be mapped to a physical memory region until it is accessed a first time. When a `mmap`ed page is accessed for the first time, the kernel will realize that the virtual page does not have a corresponding physical page but is `mmap`ed to a file. So it will load the corresponding page from disk to the page cache (RAM) and then associate the virtual page with the page cache page. This is called a **major page fault**. On subsequent access, the virtual page is already mapped to a physical page in the page cache and no disk access is needed. This is called a **minor page fault** [1].
 
 Concretely, in our Llama example, the `DefaultModelLoader` calls methods like `multi_thread_safetensors_weights_iterator`, which return an iterator over pairs (`tensor_name`, `tensor_weights`) where `tensor_weights` is an `mmap`'ed tensor. This iterator is passed to `LlamaForCausalLM`, which passes each parameter (like `ColumnParallelLinear`) its tensor weights. The parameter will then get a view of its needed weights according to its rank (`tp_rank` in the case of `ColumnParallelLinear`) and will then initiate a host (CPU) to device (GPU) copy of the weights.
 
 ![Weight loading: mmap to shard to GPU](./weight-loading.png)
 
-My hypothesis is that this triggers a **major page fault** for each page touched, which gets loaded from Lustre going through the network to the page cache and then copied to GPU. This would be a very slow process, especially for large models with many tensors spread over many pages. [^2]
+My hypothesis is that this triggers a **major page fault** for each page touched, which gets loaded from Lustre going through the network to the page cache and then copied to GPU. This would be a very slow process, especially for large models with many tensors spread over many pages [2].
 
 To check this, we run the exact same experiment with SGLang's `--weight-loader-disable-mmap`, which skips `mmap` entirely.
 
@@ -52,7 +53,7 @@ We get **45.7s** for weight loading, which is **9.9x faster** than the default l
 
 > **Lesson.** For weight loading using an HDD-backed Lustre file system, using `mmap` is a bad idea. The simple `--weight-loader-disable-mmap` flag is a huge improvement.
 
-This still leaves another possible explanation: maybe it's not `mmap` itself but the many small host-to-device copies it causes. Let's try another one-flag method that does not use `mmap`: `fastsafetensors` [^3] (`--load-format fastsafetensors`) partitions files across TP ranks; each TP process reads a file with `pread` and then exchanges the weights with other TP ranks using NCCL communication. *Once all weights are on each GPU, tensors are parsed one by one directly in GPU memory*. This eliminates the need for small tensor copies from host to device. If the small copies were the real bottleneck, this should beat `--weight-loader-disable-mmap`.
+This still leaves another possible explanation: maybe it's not `mmap` itself but the many small host-to-device copies it causes. Let's try another one-flag method that does not use `mmap`: `fastsafetensors` [3] (`--load-format fastsafetensors`) partitions files across TP ranks; each TP process reads a file with `pread` and then exchanges the weights with other TP ranks using NCCL communication. *Once all weights are on each GPU, tensors are parsed one by one directly in GPU memory*. This eliminates the need for small tensor copies from host to device. If the small copies were the real bottleneck, this should beat `--weight-loader-disable-mmap`.
 
 We get **59.1s** for weight loading, which is **7.7x faster** than the default loader but worse than `--weight-loader-disable-mmap`. This confirms again that the bottleneck was `mmap` and not the small tensor copies from host to device.
 
@@ -65,8 +66,6 @@ Let's set SGLang aside for a moment and ask a simpler question:
 *Irrespective of SGLang, how fast can we load files from Lustre?*
 
 **Across OST parallelism.** Lustre is a distributed file system that saves files across different *Object Storage Targets (OSTs)*. Each OST is a storage volume that can be accessed independently. To increase the read bandwidth, we need to distribute the model weights across multiple OSTs so we can benefit from parallelism across OSTs. In our case, we will have each `.safetensors` file in a different OST. For models like `Llama-3.1-70B-Instruct`, there are 30 `.safetensors` files.
-
-![Lustre data storage](./lustre.png)
 
 However, single OSTs also benefit from having many requests in flight.
 
@@ -179,7 +178,7 @@ This sweep uses SGLang v0.5.16 (image `lmsysorg/sglang:v0.5.16`).
 
 **servekit's limitations**
 
-- **On Correctness**: We rely on `ShardedStateLoader`, the loader behind `--load-format sharded_state`, which we discovered contained some bugs. To spot bugs, we use `servekit verify --url <ip> -record gold.json` to record the gold logprobs of a model served with the default loader, and then use `servekit verify --url <ip> -compare gold.json` to compare the logprobs of the same model served with `servekit`. This is a very strict test that checks that the logprobs are equal up to `1e-6`. All models above pass this test. However, some models currently don't, because of bugs in `ShardedStateLoader` (e.g. `gpt-oss-20b`). It is therefore important, when using `servekit`, to first check that your model is supported with `servekit verify`. See [this sbatch script](https://github.com/eth-easl/servekit/blob/main/tests/e2e/scripts/glm51-fp8-multinode-pp.sbatch) for an example of how we use `servekit verify` to check a model (GLM-5.1-FP8, multinode, TP4/PP4/EP4) against a baseline before trusting the presharded loader for it.
+- **On Correctness**: `servekit` relies on `ShardedStateLoader`, the loader behind `--load-format sharded_state`, which we discovered contained some bugs. To spot bugs, we use `servekit verify --url <ip> -record gold.json` to record the gold logprobs of a model served with the default loader, and then use `servekit verify --url <ip> -compare gold.json` to compare the logprobs of the same model served with `servekit`. This is a very strict test that checks that the logprobs are equal up to `1e-6`. All models above pass this test. However, some models currently don't, because of bugs in `ShardedStateLoader` (e.g. `gpt-oss-20b`). It is therefore important, when using `servekit`, to first check that your model is supported with `servekit verify`. See [this sbatch script](https://github.com/eth-easl/servekit/blob/main/tests/e2e/scripts/glm51-fp8-multinode-pp.sbatch) for an example of how we use `servekit verify` to check a model (GLM-5.1-FP8, multinode, TP4/PP4/EP4) against a baseline before trusting the presharded loader for it.
 
   I discovered and reported two bugs in `ShardedStateLoader` to the SGLang team: [#34448](https://github.com/sgl-project/sglang/issues/34448) (mxfp4 weights are silently dropped, relevant for Kimi-K3) and [#35702](https://github.com/sgl-project/sglang/issues/35702) (`sharded_state` cannot load MLA models, relevant for GLM-5.x; `servekit` currently patches this one, but that is not a permanent solution). The corresponding fixes are in PRs [#35715](https://github.com/sgl-project/sglang/pull/35715) and [#34558](https://github.com/sgl-project/sglang/pull/34558), respectively.
 
@@ -196,10 +195,12 @@ This sweep uses SGLang v0.5.16 (image `lmsysorg/sglang:v0.5.16`).
 
 ## Final Thoughts
 
-I learnt a lot in this project! I hope this post will be of help to you if you are facing slow weight loading times. If you use HDD backed Lustre storage for you weights and you want to try [`servekit`](https://github.com/eth-easl/servekit), do not hesitate to reach out to me at my email: "name dot family name at gmail dot com". I will be happy to help you get started with it.
+I learnt a lot in this project! I hope this post will be of help to you if you are facing slow weight loading times. If you use HDD backed Lustre storage for your weights and you want to try [`servekit`](https://github.com/eth-easl/servekit), do not hesitate to open an issue on the [servekit repository](https://github.com/eth-easl/servekit). I will be happy to help you get started with it.
 
-[^1]: A threadpool of size 8 is used to do mmap in parallel.
+## References
 
-[^2]: Actually, when a page fault happens a certain number X of pages is loaded at once for efficiency, thanks to readahead. This X is set by the Lustre client. However, even with this in mind, the general intuition that this causes many small network round trips remains.
+[1] A threadpool of size 8 is used to do mmap in parallel.
 
-[^3]: [Speeding up Model Loading with fastsafetensors](https://arxiv.org/abs/2505.23072) ([GitHub](https://github.com/foundation-model-stack/fastsafetensors))
+[2] Actually, when a page fault happens a certain number X of pages is loaded at once for efficiency, thanks to readahead. This X is set by the Lustre client. However, even with this in mind, the general intuition that this causes many small network round trips remains.
+
+[3] Speeding up Model Loading with fastsafetensors. https://arxiv.org/abs/2505.23072 ([GitHub](https://github.com/foundation-model-stack/fastsafetensors))
